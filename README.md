@@ -9,7 +9,10 @@ FastAPI 服务：接收 Intel HEX 文本，逐行校验（字节数 + 二补校�
 （初始栈顶、复位向量、Thumb 位与 ram/executable 区域归属），或将多个带唯一名称的
 Intel HEX 映像按绝对地址叠加合并（同值归并并记录全部来源、冲突按连续段报告、入口一致性校验），
 以及对组装后的整像计算**与记录分片/空洞表示无关的规范化内容指纹（SHA-256）**，
-同时返回每段摘要、总字节数、入口地址与规范化清单；还可把组装后的映像**重新导出为
+同时返回每段摘要、总字节数、入口地址与规范化清单；还可在显式给定的按块对齐地址范围上
+**构建二进制 SHA-256 Merkle 清单**（范围内缺失字节按 `0xFF` 物化、最多 4096 块、
+奇数层复制末节点），返回根哈希、各块叶摘要与任意指定地址所属块的**有方向兄弟路径**；
+还可把组装后的映像**重新导出为
 规范化 Intel HEX 文本**（按 `max_data_bytes` 确定性切分数据记录、任何记录不跨越
 64 KiB 地址窗口、窗口切换时输出扩展线性地址记录、全部记录重算二补校验和、可选保留
 入口地址），并返回导出的 HEX 文本与记录数。
@@ -773,6 +776,123 @@ curl -s -X POST http://localhost:8000/api/v1/export-hex \
   各记录数为 0、`total_bytes` 为 0，不生成任何文本；`max_data_bytes` 越界
   （<1 或 >255）返回 422。
 
+### `POST /api/v1/image-merkle-manifest`
+
+分块 Merkle 清单：复用同一 Intel HEX 解析器组装映像后，在**显式给定的半开地址范围
+`[range_start, range_end)`** 上铺设等大网格（`chunk_size` 字节/块），把范围内
+**映像未显式给出的字节一律按 `0xFF` 物化**（NOR 闪存擦除态；映像在范围外的字节不参与），
+再对各块构建二进制 SHA-256 Merkle 树，并为 `proof_addresses` 中每个地址给出所属块的
+**自叶向根、带方向的兄弟路径**。
+
+```
+叶哈希   leaf(c)   = SHA256(0x00 || 块起始地址:u32 大端 || 块数据[chunk_size])
+父哈希   parent    = SHA256(0x01 || 左哈希 || 右哈希)
+奇数层               节点数为奇数时复制末节点用于配对（单块时根即叶哈希）
+```
+
+叶哈希中的 4 字节大端块起始地址把叶绑定到绝对地址：**相同字节放在不同地址，叶摘要不同**。
+
+```bash
+curl -s -X POST http://localhost:8000/api/v1/image-merkle-manifest \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "hex_text": ":020000040800F2\n:080000000102030405060708D4\n:00000001FF\n",
+    "range_start": 134217728,
+    "range_end": 134217760,
+    "chunk_size": 16,
+    "proof_addresses": [134217730, 134217744]
+  }' | jq
+```
+
+参数与前置校验（恒返回 200，以 `ok` 判定）：
+
+- `range_start`/`range_end` 为 32 位空间（`0`..`0xFFFFFFFF`，`range_end` 可取
+  `0x100000000`）内的**非空半开区间**（`range_start < range_end`），否则
+  `invalid_range`；
+- 两个端点都必须对齐到 `chunk_size`（正整数；为 0/负返回 422），否则
+  `range_unaligned`（消息中说明哪个端点偏离边界多少字节）；
+- 范围划分出的块数 `(range_end - range_start) / chunk_size` **不得超过 4096**
+  （`max_chunks` 回显上限），否则 `too_many_chunks`；
+- `proof_addresses` 中每个地址都必须落在 `[range_start, range_end)` 内
+  （允许 `range_end - 1`），否则逐条报告 `proof_address_out_of_range`；
+  地址允许为负整数并按越界诊断（`range_start`/`range_end` 为负则由 schema 返回 422）。
+- 与其他接口一致：**HEX 无效时不做任何参数校验、也不构树**——`hex_ok=false`、
+  `params_valid=null`、`root_sha256=null`、`chunks`/`proofs` 为空。
+- 范围形状非法时只报 `invalid_range`，不再叠加对齐/块数诊断；范围对齐但块数超限、
+  证明地址越界等问题可在同一次响应中一并返回。任一类问题存在时都**不构树**。
+
+上例（范围 32 字节 = 2 块 × 16；映像只给出前 8 字节，后 8 字节物化为 `0xFF`，
+第二块全部为 `0xFF`）响应：
+
+```json
+{
+  "ok": true,
+  "hex_ok": true,
+  "params_valid": true,
+  "error_count": 0,
+  "warning_count": 0,
+  "entry_address": null,
+  "range_start": 134217728,
+  "range_end": 134217760,
+  "chunk_size": 16,
+  "chunk_count": 2,
+  "max_chunks": 4096,
+  "root_sha256": "eade966342071958620f06579c780313a625f7a0562c428ff3ff2f9b15fcb0f6",
+  "chunks": [
+    {"index": 0, "start": 134217728, "end": 134217744, "size": 16,
+     "present_bytes": 8,
+     "sha256": "3c8d8b27ed25bcaa94219fefafceb7ce047a959a348e06afe548d9e063f61027"},
+    {"index": 1, "start": 134217744, "end": 134217760, "size": 16,
+     "present_bytes": 0,
+     "sha256": "43bd1de042d7238d732e1827e447e7de05f472f92a0a64ac82b0e8ea2d8031ef"}
+  ],
+  "proofs": [
+    {
+      "address": 134217730, "chunk_index": 0,
+      "chunk_start": 134217728, "chunk_end": 134217744, "offset": 2,
+      "leaf_sha256": "3c8d8b27ed25bcaa94219fefafceb7ce047a959a348e06afe548d9e063f61027",
+      "steps": [
+        {"level": 0, "direction": "right", "sibling_index": 1, "duplicated": false,
+         "sibling_sha256": "43bd1de042d7238d732e1827e447e7de05f472f92a0a64ac82b0e8ea2d8031ef"}
+      ]
+    },
+    {
+      "address": 134217744, "chunk_index": 1,
+      "chunk_start": 134217744, "chunk_end": 134217760, "offset": 0,
+      "leaf_sha256": "43bd1de042d7238d732e1827e447e7de05f472f92a0a64ac82b0e8ea2d8031ef",
+      "steps": [
+        {"level": 0, "direction": "left", "sibling_index": 0, "duplicated": false,
+         "sibling_sha256": "3c8d8b27ed25bcaa94219fefafceb7ce047a959a348e06afe548d9e063f61027"}
+      ]
+    }
+  ],
+  "param_errors": [],
+  "diagnostics": [ ... ]
+}
+```
+
+字段与验证语义：
+
+- `chunks[]`：按地址升序每块一条，`present_bytes` 为该块内映像显式给出的字节数
+  （其余按 `0xFF` 物化），`sha256` 即叶哈希。
+- `root_sha256`：Merkle 根。单块时根即该块叶哈希，证明路径为空。
+- `proofs[]`：与 `proof_addresses` **同序**，同一地址可重复、同一块内不同地址共享
+  相同路径（仅 `offset`/`address` 不同）。
+- `steps[]` 为**自叶向根**的兄弟序列，`level=0` 为叶层；`direction` 表示**兄弟所在
+  方向**：
+  - `"left"`：兄弟是左孩子，验证时计算 `SHA256(0x01 || sibling || running)`；
+  - `"right"`：兄弟是右孩子，验证时计算 `SHA256(0x01 || running || sibling)`。
+  
+  从 `leaf_sha256` 起按序折叠即得根哈希；`sibling_index` 为兄弟在该层中的节点序号，
+  `duplicated=true` 标记该兄弟是奇数层复制出的末节点。
+
+奇数层复制示例：3 个块时，叶层为 `c0 c1 c2`，先复制 `c2` 配成 `(c0,c1)` 与
+`(c2,c2)`，再由两个父节点配对成根；末块的第 0 步兄弟即其自身（`duplicated=true`、
+`direction="right"`）。
+
+- 同一逻辑映像无论数据记录如何分片（记录拆分、相同重写、段顺序变化），根与各块摘要
+  完全一致——物化为固定网格后只有「绝对地址 + 字节内容」参与哈希。
+
 ## 解析规则
 
 - 每行必须形如 `:llaaaatt<data>cc`；校验 `ll`（字节数）与实际数据长度一致，
@@ -801,6 +921,7 @@ app/
   vector_table.py # Cortex-M 向量表校验（小端读取、栈顶/复位/Thumb 位与区域归属，纯逻辑）
   image_merge.py  # 多映像按绝对地址叠加合并（同值归并、冲突段报告、入口一致性，纯逻辑）
   image_digest.py # 整像内容指纹（段帧规范化编码 + 整像/每段 SHA-256 + 规范化清单，纯逻辑）
+  image_merkle.py # 分块 Merkle 清单（0xFF 物化、u32be 地址叶、奇数层复制末节点、有方向证明，纯逻辑）
   hex_export.py   # Intel HEX 规范化导出（确定性记录重排、64 KiB 窗口切分、校验和重算，纯逻辑）
 tests/
   test_hex_service.py           # 解析器与 assemble 接口
@@ -811,6 +932,7 @@ tests/
   test_validate_vector_table.py # validate-vector-table 接口与向量表校验逻辑
   test_merge_images.py          # merge-images 接口与多映像合并逻辑
   test_image_digest.py          # image-digest 接口与内容指纹逻辑（分片/空洞不变性等）
+  test_image_merkle_manifest.py # image-merkle-manifest 接口与分块 Merkle/证明逻辑（物化、复制末节点、折叠验证等）
   test_export_hex.py            # export-hex 接口与规范化导出逻辑（窗口切分、不动点等）
 Dockerfile
 docker-compose.yml

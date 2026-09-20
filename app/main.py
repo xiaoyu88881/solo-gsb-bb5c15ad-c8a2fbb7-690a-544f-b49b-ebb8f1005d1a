@@ -12,6 +12,7 @@ from pydantic import BaseModel, Field, model_validator
 from .hex_export import export_intel_hex
 from .hex_parser import ParseResult, parse_intel_hex
 from .image_digest import build_image_digest
+from .image_merkle import build_merkle_manifest
 from .image_merge import MergeSource, merge_images
 from .layout import Region, validate_layout
 from .relocation import plan_relocation
@@ -40,8 +41,11 @@ app = FastAPI(
         "it reaches that target, read as a Cortex-M vector table checked "
         "against ram/executable memory regions, or fingerprinted with a "
         "canonical whole-image SHA-256 that is stable across record "
-        "splitting and gap representations. The assembled image can also "
-        "be re-emitted as a normalized Intel HEX text: deterministic "
+        "splitting and gap representations, or summarized as a "
+        "chunk-aligned binary SHA-256 Merkle manifest over an explicit "
+        "address range (missing bytes materialized as 0xFF, at most 4096 "
+        "chunks) with directional sibling proofs for selected addresses. "
+        "The assembled image can also be re-emitted as a normalized Intel HEX text: deterministic "
         "data-record layout bounded by a configurable byte count, no "
         "record crossing a 64 KiB address window, extended linear "
         "address records on window switches, recomputed checksums and "
@@ -874,6 +878,138 @@ class ExportHexResponse(BaseModel):
     diagnostics: list[DiagnosticOut]
 
 
+class ImageMerkleManifestRequest(BaseModel):
+    hex_text: str = Field(..., description="Intel HEX text, one record per line")
+    range_start: int = Field(
+        ..., ge=0, description="Inclusive start of the chunked range; 32-bit, chunk-aligned"
+    )
+    range_end: int = Field(
+        ...,
+        ge=0,
+        description="Exclusive end of the chunked range; 32-bit, chunk-aligned, > range_start",
+    )
+    chunk_size: int = Field(
+        ..., ge=1, description="Uniform chunk size in bytes; the range is split into such chunks"
+    )
+    proof_addresses: list[int] = Field(
+        ...,
+        description=(
+            "Addresses whose owning chunk gets a directional sibling path; "
+            "every address must lie inside [range_start, range_end)"
+        ),
+    )
+
+    model_config = {
+        "json_schema_extra": {
+            "examples": [
+                {
+                    "hex_text": (
+                        ":020000040800F2\n"
+                        ":080000000102030405060708D4\n"
+                        ":00000001FF\n"
+                    ),
+                    "range_start": 134217728,
+                    "range_end": 134217760,
+                    "chunk_size": 16,
+                    "proof_addresses": [134217730, 134217744],
+                }
+            ]
+        }
+    }
+
+
+class MerkleParamErrorOut(BaseModel):
+    kind: str = Field(
+        ...,
+        description=(
+            "invalid_range | range_unaligned | too_many_chunks | proof_address_out_of_range"
+        ),
+    )
+    message: str
+    start: int | None = Field(None, description="Range start, when relevant")
+    end: int | None = Field(None, description="Exclusive range end, when relevant")
+    address: int | None = Field(None, description="The offending proof address, if any")
+
+
+class ChunkDigestOut(BaseModel):
+    index: int = Field(..., description="Zero-based chunk index in address order")
+    start: int = Field(..., description="Absolute chunk start address")
+    end: int = Field(..., description="Exclusive chunk end address")
+    size: int = Field(..., description="Always chunk_size")
+    present_bytes: int = Field(
+        ...,
+        description="Bytes explicitly carried by the HEX inside this chunk (other bytes are 0xFF)",
+    )
+    sha256: str = Field(
+        ...,
+        description="Leaf hash SHA256(0x00 || start:u32be || materialized chunk bytes)",
+    )
+
+
+class ProofStepOut(BaseModel):
+    level: int = Field(..., description="Level whose nodes are paired; 0 is the leaf level")
+    direction: str = Field(
+        ...,
+        description=(
+            "left: the sibling is the left child and the running hash is the right child; "
+            "right: the opposite"
+        ),
+    )
+    sibling_index: int = Field(
+        ..., description="Index of the node supplying the sibling hash within that level"
+    )
+    sibling_sha256: str
+    duplicated: bool = Field(
+        ..., description="True when this sibling is the duplicated last node of an odd level"
+    )
+
+
+class ProofPathOut(BaseModel):
+    address: int = Field(..., description="The requested proof address")
+    chunk_index: int = Field(..., description="Index of the chunk containing the address")
+    chunk_start: int
+    chunk_end: int = Field(..., description="Exclusive end of the owning chunk")
+    offset: int = Field(..., description="Byte offset of the address inside its chunk")
+    leaf_sha256: str = Field(..., description="Hash of the owning chunk; verification starts here")
+    steps: list[ProofStepOut] = Field(
+        ..., description="Bottom-up directional sibling path; folding it yields the root"
+    )
+
+
+class ImageMerkleManifestResponse(BaseModel):
+    ok: bool = Field(
+        ...,
+        description="True when the HEX parses and every range/chunk/proof parameter is valid",
+    )
+    hex_ok: bool = Field(..., description="True when the Intel HEX text passed validation")
+    params_valid: bool | None = Field(
+        ...,
+        description="True when range alignment, chunk cap and proof addresses are valid; "
+        "null when the parameter check did not run (invalid HEX)",
+    )
+    error_count: int
+    warning_count: int
+    entry_address: int | None = Field(None, description="From the last 03/05 record, if present")
+    range_start: int
+    range_end: int
+    chunk_size: int
+    chunk_count: int = Field(
+        ..., description="Number of chunks materialized (0 when no tree was built)"
+    )
+    max_chunks: int = Field(..., description="Hard cap on chunk_count (4096)")
+    root_sha256: str | None = Field(None, description="Merkle root; null when no tree was built")
+    chunks: list[ChunkDigestOut] = Field(
+        ..., description="One digest per chunk in address order; empty when no tree was built"
+    )
+    proofs: list[ProofPathOut] = Field(
+        ..., description="Directional sibling path per requested address, in request order"
+    )
+    param_errors: list[MerkleParamErrorOut] = Field(
+        ..., description="Parameter-level problems; non-empty only when params_valid is false"
+    )
+    diagnostics: list[DiagnosticOut]
+
+
 def _build_response(result: ParseResult) -> AssembleResponse:
     return AssembleResponse(
         ok=result.ok,
@@ -1628,5 +1764,108 @@ def export_hex_route(request: ExportHexRequest) -> ExportHexResponse:
         data_record_count=exported.data_record_count,
         extended_address_record_count=exported.extended_address_record_count,
         entry_record_count=exported.entry_record_count,
+        **base_fields,
+    )
+
+
+@app.post(
+    "/api/v1/image-merkle-manifest",
+    response_model=ImageMerkleManifestResponse,
+    tags=["merkle"],
+)
+def image_merkle_manifest_route(
+    request: ImageMerkleManifestRequest,
+) -> ImageMerkleManifestResponse:
+    """Build a chunk-aligned SHA-256 Merkle manifest over an address range.
+
+    The HEX text is parsed with the shared validator and the same
+    diagnostics are returned. When parsing fails no tree is built
+    (``root_sha256`` null, ``chunks``/``proofs`` empty,
+    ``params_valid`` null). Otherwise the half-open range
+    ``[range_start, range_end)`` must lie inside the 32-bit address
+    space, be non-empty, and have both endpoints aligned to
+    ``chunk_size``; it may span at most 4096 chunks, and every
+    ``proof_addresses`` entry must fall inside it. Missing bytes inside
+    the range are materialized as ``0xFF`` (image bytes outside the
+    range do not participate). Leaves hash
+    ``SHA256(0x00 || chunk_start:u32be || chunk bytes)``; parents hash
+    ``SHA256(0x01 || left || right)``, duplicating the last node of an
+    odd level. Each proof path lists bottom-up directional siblings:
+    ``direction == "left"`` combines
+    ``SHA256(0x01 || sibling || running)``, ``"right"`` combines
+    ``SHA256(0x01 || running || sibling)``.
+    """
+    parsed = parse_intel_hex(request.hex_text)
+    diagnostics = [DiagnosticOut(**vars(d)) for d in parsed.diagnostics]
+    base_fields = dict(
+        error_count=parsed.error_count,
+        warning_count=parsed.warning_count,
+        entry_address=parsed.entry_address,
+        range_start=request.range_start,
+        range_end=request.range_end,
+        chunk_size=request.chunk_size,
+        diagnostics=diagnostics,
+    )
+    if not parsed.ok:
+        return ImageMerkleManifestResponse(
+            ok=False,
+            hex_ok=False,
+            params_valid=None,
+            chunk_count=0,
+            max_chunks=4096,
+            root_sha256=None,
+            chunks=[],
+            proofs=[],
+            param_errors=[],
+            **base_fields,
+        )
+
+    manifest = build_merkle_manifest(
+        parsed.segments,
+        request.range_start,
+        request.range_end,
+        request.chunk_size,
+        request.proof_addresses,
+    )
+    return ImageMerkleManifestResponse(
+        ok=manifest.ok,
+        hex_ok=True,
+        params_valid=manifest.params_valid,
+        chunk_count=manifest.chunk_count,
+        max_chunks=4096,
+        root_sha256=manifest.root_sha256,
+        chunks=[
+            ChunkDigestOut(
+                index=chunk.index,
+                start=chunk.start,
+                end=chunk.end,
+                size=chunk.size,
+                present_bytes=chunk.present_bytes,
+                sha256=chunk.sha256,
+            )
+            for chunk in manifest.chunks
+        ],
+        proofs=[
+            ProofPathOut(
+                address=proof.address,
+                chunk_index=proof.chunk_index,
+                chunk_start=proof.chunk_start,
+                chunk_end=proof.chunk_end,
+                offset=proof.offset,
+                leaf_sha256=proof.leaf_sha256,
+                steps=[
+                    ProofStepOut(
+                        level=step.level,
+                        direction=step.direction,
+                        sibling_index=step.sibling_index,
+                        sibling_sha256=step.sibling_sha256,
+                        duplicated=step.duplicated,
+                    )
+                    for step in proof.steps
+                ],
+            )
+            for proof in manifest.proofs
+        ],
+        param_errors=[MerkleParamErrorOut(**vars(e)) for e in manifest.param_errors],
         **base_fields,
     )
