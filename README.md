@@ -9,7 +9,10 @@ FastAPI 服务：接收 Intel HEX 文本，逐行校验（字节数 + 二补校�
 （初始栈顶、复位向量、Thumb 位与 ram/executable 区域归属），或将多个带唯一名称的
 Intel HEX 映像按绝对地址叠加合并（同值归并并记录全部来源、冲突按连续段报告、入口一致性校验），
 以及对组装后的整像计算**与记录分片/空洞表示无关的规范化内容指纹（SHA-256）**，
-同时返回每段摘要、总字节数、入口地址与规范化清单；还可把组装后的映像**重新导出为
+同时返回每段摘要、总字节数、入口地址与规范化清单；还可在**按块对齐的固定地址窗口**上把映像
+（窗口内缺失字节按 `0xFF` 物化）组织成**二进制 SHA-256 Merkle 树**，返回根哈希、各块叶摘要
+以及对每个待证明地址给出的**有方向兄弟包含证明**（非法 HEX、未对齐/越界窗口、超块数上限、
+映像或证明地址越界时均不构树并返回明确诊断）；还可把组装后的映像**重新导出为
 规范化 Intel HEX 文本**（按 `max_data_bytes` 确定性切分数据记录、任何记录不跨越
 64 KiB 地址窗口、窗口切换时输出扩展线性地址记录、全部记录重算二补校验和、可选保留
 入口地址），并返回导出的 HEX 文本与记录数。
@@ -715,6 +718,116 @@ curl -s -X POST http://localhost:8000/api/v1/image-digest \
 时也各自相同。只改一个字节、移动安放地址或改变入口地址才会改变默认指纹；
 其中仅改变入口地址时，`include_entry=false` 的「字节/安放」指纹保持不变。
 
+### `POST /api/v1/image-merkle-manifest`
+
+分块 Merkle 清单：在**按块对齐的固定半开窗口 `[range_start, range_end)`** 上把组装后的映像
+组织成一棵**二进制 SHA-256 Merkle 树**。窗口内**映像未显式给出的字节一律按擦除态 `0xFF` 物化**，
+因此即使输入是稀疏段，每个块也是定长的；树的形态只取决于窗口与 `chunk_size`，与记录切分方式无关。
+
+- 叶哈希（块起始地址以 **4 字节大端**编码并绑定到摘要）：
+  `SHA256(0x00 || 块起始地址:u32-be || 块数据)`
+- 父节点：`SHA256(0x01 || 左哈希 || 右哈希)`
+- **每层节点数为奇数时复制末节点**再配对（即末节点与自身配对）；
+  只有一个块时根哈希即叶哈希。
+
+```bash
+curl -s -X POST http://localhost:8000/api/v1/image-merkle-manifest \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "hex_text": ":020000040800F2\n:080000000102030405060708D4\n:00000001FF\n",
+    "range_start": 134217728,
+    "range_end": 134217744,
+    "chunk_size": 8,
+    "proof_addresses": [134217730]
+  }' | jq
+```
+
+上例窗口 `0x08000000..0x08000010` 切成 2 个 8 字节块：块 0 为映像给出的
+`01 02 03 04 05 06 07 08`，块 1 完全缺失、物化为 8 个 `FF`。响应（恒为 200）：
+
+```json
+{
+  "ok": true,
+  "hex_ok": true,
+  "params_valid": true,
+  "error_count": 0,
+  "warning_count": 0,
+  "entry_address": null,
+  "total_bytes": 8,
+  "range_start": 134217728,
+  "range_end": 134217744,
+  "chunk_size": 8,
+  "max_chunks": 4096,
+  "chunk_count": 2,
+  "root": "79b411f827ca0e4c535a802a3b1555490143848f80d32689cec85515b7a639bc",
+  "chunks": [
+    {"index": 0, "start": 134217728, "end": 134217736,
+     "digest": "00e46f8e15257978f7f73ebabcf983746b7c184080fa687572a49b339ce9f4db"},
+    {"index": 1, "start": 134217736, "end": 134217744,
+     "digest": "c664302d5474342b5851891c6114470888056139e9aac87f9c803bc570f11cf0"}
+  ],
+  "proofs": [
+    {"address": 134217730, "chunk_index": 0,
+     "chunk_start": 134217728, "chunk_end": 134217736,
+     "leaf": "00e46f8e15257978f7f73ebabcf983746b7c184080fa687572a49b339ce9f4db",
+     "path": [
+       {"direction": "right",
+        "digest": "c664302d5474342b5851891c6114470888056139e9aac87f9c803bc570f11cf0"}
+     ]}
+  ],
+  "param_errors": [],
+  "diagnostics": [ ... ]
+}
+```
+
+- `root`：Merkle 根（十六进制）；`chunks[]` 按块下标升序给出每块的叶摘要
+  （`digest = SHA256(0x00 || start:u32-be || 数据)`），`start`/`end` 为半开区间。
+- `proofs[]`：与 `proof_addresses` **一一对应、保持请求顺序**。每个证明给出地址所属块
+  （`chunk_index`/`chunk_start`/`chunk_end`）、该块 `leaf` 与从叶到根的**有方向兄弟路径**
+  `path[]`：`direction` 表示兄弟相对当前节点的位置——`left` 表示验证者应把兄弟摘要拼在
+  **左侧**（`SHA256(0x01 || 兄弟 || 当前)`），`right` 表示拼在**右侧**
+  （`SHA256(0x01 || 当前 || 兄弟)`）；逐层计算即可由单个叶摘要复算 `root`。
+  奇数层复制出的末节点在路径中体现为一个 `right` 兄弟，其摘要与当前节点相同。
+- 待证明地址只需落在窗口内（`range_end` 本身按半开区间不算在内），**不要求块对齐**；
+  省略 `proof_addresses` 时只建树、不返回证明。
+- **前置不合法时绝不构树**（`root` 为 `null`、`chunks`/`proofs` 为空、`chunk_count` 为 0）：
+  - HEX 无效：只返回逐行 `diagnostics`，`hex_ok=false`、`params_valid=null`；
+  - 参数不合法：`hex_ok=true`、`params_valid=false`，`param_errors[]` 给出结构化诊断。
+
+参数错误码与判定：
+
+- `invalid_range`：`[range_start, range_end)` 不是 32 位空间内的非空半开区间
+  （须满足 `0 <= range_start < range_end <= 0x100000000`）；
+- `range_not_aligned`：`range_start` 或 `range_end` **未对齐到 `chunk_size`**
+  （诊断中回显各自的取模余数）；
+- `invalid_chunk_size`：`chunk_size` 非正整数（小于 1 由请求模式直接返回 422）；
+- `too_many_chunks`：`(range_end - range_start) / chunk_size` **超过 4096 块**
+  （回显 `chunk_count`）；
+- `image_outside_range`：组装映像存在窗口之外的字节（分别报告落在窗口之前/之后的地址范围）；
+- `proof_outside_range`：某个待证明地址不在窗口内（回显其在 `proof_addresses` 中的
+  0 基下标 `proof_index` 与 `address`）。
+
+```json
+{
+  "ok": false,
+  "hex_ok": true,
+  "params_valid": false,
+  "chunk_count": 0,
+  "root": null,
+  "chunks": [],
+  "proofs": [],
+  "param_errors": [
+    {"kind": "range_not_aligned",
+     "message": "range_start and range_end must both be aligned to chunk_size 8: ...",
+     "start": 134217728, "end": 134217743, "address": null,
+     "chunk_size": 8, "chunk_count": null, "proof_index": null}
+  ],
+  "diagnostics": [ ... ]
+}
+```
+
+同一逻辑映像无论怎样切分数据记录，只要窗口与块大小相同，`root` 与全部块摘要都相同。
+
 ### `POST /api/v1/export-hex`
 
 Intel HEX 规范化导出：复用同一解析器组装映像后，把连续映像**确定性地重排为数据记录**
@@ -801,6 +914,7 @@ app/
   vector_table.py # Cortex-M 向量表校验（小端读取、栈顶/复位/Thumb 位与区域归属，纯逻辑）
   image_merge.py  # 多映像按绝对地址叠加合并（同值归并、冲突段报告、入口一致性，纯逻辑）
   image_digest.py # 整像内容指纹（段帧规范化编码 + 整像/每段 SHA-256 + 规范化清单，纯逻辑）
+  image_merkle.py # 分块 Merkle 清单（0xFF 物化、叶/父哈希、奇数层复制末节点、有方向包含证明，纯逻辑）
   hex_export.py   # Intel HEX 规范化导出（确定性记录重排、64 KiB 窗口切分、校验和重算，纯逻辑）
 tests/
   test_hex_service.py           # 解析器与 assemble 接口
@@ -811,6 +925,7 @@ tests/
   test_validate_vector_table.py # validate-vector-table 接口与向量表校验逻辑
   test_merge_images.py          # merge-images 接口与多映像合并逻辑
   test_image_digest.py          # image-digest 接口与内容指纹逻辑（分片/空洞不变性等）
+  test_image_merkle.py          # image-merkle-manifest 接口与分块 Merkle 树/包含证明逻辑
   test_export_hex.py            # export-hex 接口与规范化导出逻辑（窗口切分、不动点等）
 Dockerfile
 docker-compose.yml

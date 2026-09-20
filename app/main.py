@@ -12,6 +12,7 @@ from pydantic import BaseModel, Field, model_validator
 from .hex_export import export_intel_hex
 from .hex_parser import ParseResult, parse_intel_hex
 from .image_digest import build_image_digest
+from .image_merkle import MAX_CHUNKS, build_image_merkle
 from .image_merge import MergeSource, merge_images
 from .layout import Region, validate_layout
 from .relocation import plan_relocation
@@ -41,11 +42,15 @@ app = FastAPI(
         "against ram/executable memory regions, or fingerprinted with a "
         "canonical whole-image SHA-256 that is stable across record "
         "splitting and gap representations. The assembled image can also "
-        "be re-emitted as a normalized Intel HEX text: deterministic "
-        "data-record layout bounded by a configurable byte count, no "
-        "record crossing a 64 KiB address window, extended linear "
-        "address records on window switches, recomputed checksums and "
-        "optional entry-address preservation."
+        "be hashed as a chunk-aligned binary SHA-256 Merkle tree over a "
+        "fixed address window (missing bytes materialized as 0xFF), "
+        "returning the root, per-chunk leaf digests and directed "
+        "leaf-to-root inclusion proofs for requested addresses. The "
+        "assembled image can also be re-emitted as a normalized Intel "
+        "HEX text: deterministic data-record layout bounded by a "
+        "configurable byte count, no record crossing a 64 KiB address "
+        "window, extended linear address records on window switches, "
+        "recomputed checksums and optional entry-address preservation."
     ),
 )
 
@@ -874,6 +879,122 @@ class ExportHexResponse(BaseModel):
     diagnostics: list[DiagnosticOut]
 
 
+class ImageMerkleRequest(BaseModel):
+    hex_text: str = Field(..., description="Intel HEX text, one record per line")
+    range_start: int = Field(
+        ..., ge=0, description="Inclusive window start; aligned to chunk_size"
+    )
+    range_end: int = Field(
+        ..., ge=0, description="Exclusive window end; aligned to chunk_size"
+    )
+    chunk_size: int = Field(
+        ..., ge=1, description=f"Uniform chunk size in bytes; at most {MAX_CHUNKS} chunks"
+    )
+    proof_addresses: list[int] = Field(
+        default_factory=list,
+        description="Addresses to return directed leaf-to-root inclusion proofs for",
+    )
+
+    model_config = {
+        "json_schema_extra": {
+            "examples": [
+                {
+                    "hex_text": (
+                        ":020000040800F2\n"
+                        ":080000000102030405060708D4\n"
+                        ":00000001FF\n"
+                    ),
+                    "range_start": 134217728,
+                    "range_end": 134217744,
+                    "chunk_size": 8,
+                    "proof_addresses": [134217730],
+                }
+            ]
+        }
+    }
+
+
+class MerkleParamErrorOut(BaseModel):
+    kind: str = Field(
+        ...,
+        description=(
+            "invalid_range | range_not_aligned | invalid_chunk_size | "
+            "too_many_chunks | image_outside_range | proof_outside_range"
+        ),
+    )
+    message: str
+    start: int | None = Field(None, description="First affected address, if applicable")
+    end: int | None = Field(None, description="Exclusive end of the affected range, if applicable")
+    address: int | None = Field(None, description="Offending proof address, if applicable")
+    chunk_size: int | None = Field(None, description="Requested chunk size, when relevant")
+    chunk_count: int | None = Field(None, description="Chunk count that breached the cap, if any")
+    proof_index: int | None = Field(
+        None, description="0-based position of the offending requested proof address"
+    )
+
+
+class MerkleChunkOut(BaseModel):
+    index: int = Field(..., description="Zero-based chunk position in address order")
+    start: int = Field(..., description="Absolute chunk start address")
+    end: int = Field(..., description="Exclusive chunk end address")
+    digest: str = Field(
+        ...,
+        description="Hex leaf digest SHA256(0x00 || start:u32-be || chunk data)",
+    )
+
+
+class MerkleProofStepOut(BaseModel):
+    direction: str = Field(
+        ...,
+        description=(
+            "Sibling position relative to the current node: 'left' means the "
+            "verifier prepends the sibling digest, 'right' means it appends it"
+        ),
+    )
+    digest: str = Field(..., description="Hex sibling node digest")
+
+
+class MerkleProofOut(BaseModel):
+    address: int = Field(..., description="Requested proof address")
+    chunk_index: int = Field(..., description="Index of the chunk containing the address")
+    chunk_start: int = Field(..., description="Start address of that chunk")
+    chunk_end: int = Field(..., description="Exclusive end address of that chunk")
+    leaf: str = Field(..., description="Hex digest of the owning chunk's leaf")
+    path: list[MerkleProofStepOut] = Field(
+        ..., description="Directed siblings from the leaf level up to (but excluding) the root"
+    )
+
+
+class ImageMerkleResponse(BaseModel):
+    ok: bool = Field(
+        ..., description="True when the HEX parses and every parameter check passes"
+    )
+    hex_ok: bool = Field(..., description="True when the Intel HEX text passed validation")
+    params_valid: bool | None = Field(
+        ...,
+        description="True when window/alignment/placement/proof parameters are valid; "
+        "null when the parameter check did not run (invalid HEX)",
+    )
+    error_count: int
+    warning_count: int
+    entry_address: int | None = Field(None, description="From the last 03/05 record, if present")
+    total_bytes: int = Field(..., description="Sum of segment byte counts")
+    range_start: int
+    range_end: int
+    chunk_size: int
+    max_chunks: int = Field(..., description=f"Hard cap on chunk count ({MAX_CHUNKS})")
+    chunk_count: int = Field(..., description="Chunks covered by the window (0 when no tree built)")
+    root: str | None = Field(None, description="Hex Merkle root; null when no tree was built")
+    chunks: list[MerkleChunkOut] = Field(..., description="Per-chunk leaf summaries in order")
+    proofs: list[MerkleProofOut] = Field(
+        ..., description="One inclusion proof per requested address, in request order"
+    )
+    param_errors: list[MerkleParamErrorOut] = Field(
+        ..., description="Parameter-level problems; non-empty only when params_valid is false"
+    )
+    diagnostics: list[DiagnosticOut]
+
+
 def _build_response(result: ParseResult) -> AssembleResponse:
     return AssembleResponse(
         ok=result.ok,
@@ -1629,4 +1750,114 @@ def export_hex_route(request: ExportHexRequest) -> ExportHexResponse:
         extended_address_record_count=exported.extended_address_record_count,
         entry_record_count=exported.entry_record_count,
         **base_fields,
+    )
+
+
+@app.post(
+    "/api/v1/image-merkle-manifest",
+    response_model=ImageMerkleResponse,
+    tags=["digest"],
+)
+def image_merkle_manifest_route(request: ImageMerkleRequest) -> ImageMerkleResponse:
+    """Build a chunk-aligned binary SHA-256 Merkle manifest over a window.
+
+    The HEX text is parsed with the shared validator and the same
+    diagnostics are returned. When parsing fails no tree is built
+    (``params_valid`` null, ``root`` null). Otherwise the half-open
+    window ``[range_start, range_end)`` must lie inside 32-bit space, be
+    non-empty, and have both ends aligned to ``chunk_size``; it may cover
+    at most 4096 chunks; every image byte must lie inside it, and every
+    requested proof address as well. Missing bytes inside the window are
+    materialized as ``0xFF``. Leaves hash as
+    ``SHA256(0x00 || chunk start:u32-be || chunk bytes)`` and parents as
+    ``SHA256(0x01 || left || right)``; an odd level duplicates its last
+    node. The response carries the hex root, one leaf digest per chunk,
+    and the directed sibling path (``left``/``right``) from each
+    requested address's owning leaf to the root.
+    """
+    parsed = parse_intel_hex(request.hex_text)
+    diagnostics = [DiagnosticOut(**vars(d)) for d in parsed.diagnostics]
+    parse_fields = dict(
+        error_count=parsed.error_count,
+        warning_count=parsed.warning_count,
+        entry_address=parsed.entry_address,
+        total_bytes=parsed.total_bytes,
+        diagnostics=diagnostics,
+    )
+    if not parsed.ok:
+        return ImageMerkleResponse(
+            ok=False,
+            hex_ok=False,
+            params_valid=None,
+            range_start=request.range_start,
+            range_end=request.range_end,
+            chunk_size=request.chunk_size,
+            max_chunks=MAX_CHUNKS,
+            chunk_count=0,
+            root=None,
+            chunks=[],
+            proofs=[],
+            param_errors=[],
+            **parse_fields,
+        )
+
+    manifest = build_image_merkle(
+        parsed.segments,
+        request.range_start,
+        request.range_end,
+        request.chunk_size,
+        request.proof_addresses,
+    )
+    if not manifest.params_valid:
+        return ImageMerkleResponse(
+            ok=False,
+            hex_ok=True,
+            params_valid=False,
+            range_start=manifest.range_start,
+            range_end=manifest.range_end,
+            chunk_size=manifest.chunk_size,
+            max_chunks=MAX_CHUNKS,
+            chunk_count=0,
+            root=None,
+            chunks=[],
+            proofs=[],
+            param_errors=[MerkleParamErrorOut(**vars(e)) for e in manifest.param_errors],
+            **parse_fields,
+        )
+
+    return ImageMerkleResponse(
+        ok=True,
+        hex_ok=True,
+        params_valid=True,
+        range_start=manifest.range_start,
+        range_end=manifest.range_end,
+        chunk_size=manifest.chunk_size,
+        max_chunks=MAX_CHUNKS,
+        chunk_count=manifest.chunk_count,
+        root=manifest.root.hex(),
+        chunks=[
+            MerkleChunkOut(
+                index=chunk.index,
+                start=chunk.start,
+                end=chunk.end,
+                digest=chunk.digest.hex(),
+            )
+            for chunk in manifest.chunks
+        ],
+        proofs=[
+            MerkleProofOut(
+                address=proof.address,
+                chunk_index=proof.chunk_index,
+                chunk_start=proof.chunk_start,
+                chunk_end=proof.chunk_end,
+                leaf=proof.leaf.hex(),
+                path=[
+                    MerkleProofStepOut(direction=step.direction, digest=step.digest.hex())
+                    for step in proof.path
+                ],
+            )
+            for proof in manifest.proofs
+        ],
+        param_errors=[],
+        **parse_fields,
     )
